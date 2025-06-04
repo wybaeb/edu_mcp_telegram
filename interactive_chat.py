@@ -10,7 +10,51 @@ import sys
 import signal
 import requests
 from typing import Dict, Any, List, Optional
-from test_client import MCPTestClient, OllamaIntegration
+from test_client import MCPTestClient
+
+
+class OllamaIntegration:
+    """Интеграция с локальным Ollama для tool calling"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "mistral:latest"):
+        self.base_url = base_url
+        self.model = model
+    
+    def check_ollama_availability(self) -> bool:
+        """Проверка доступности Ollama"""
+        try:
+            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def chat_with_tools(self, messages: List[Dict], tools: List[Dict]) -> Dict:
+        """Отправка запроса в Ollama с инструментами"""
+        try:
+            # Подготавливаем payload согласно документации Ollama
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "stream": False
+            }
+            
+            # Добавляем инструменты если есть
+            if tools:
+                payload["tools"] = tools
+            
+            response = requests.post(
+                f"{self.base_url}/api/chat", 
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {"error": f"HTTP {response.status_code}: {response.text}"}
+                
+        except Exception as e:
+            return {"error": f"Ошибка запроса: {e}"}
 
 
 class InteractiveMCPChat:
@@ -246,141 +290,170 @@ class InteractiveMCPChat:
             if self.verbose_mode:
                 print("🔧 Получаю список доступных MCP инструментов...")
             
-            available_tools = await self.mcp_client.list_tools()
+            mcp_tools = await self.mcp_client.list_tools()
             
-            # Преобразуем MCP инструменты в формат для Ollama
-            tools_for_llm = []
-            for tool in available_tools:
-                tools_for_llm.append({
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["inputSchema"]
-                })
+            # Преобразуем MCP инструменты в формат Ollama
+            ollama_tools = []
+            for tool in mcp_tools:
+                ollama_tool = {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["inputSchema"]
+                    }
+                }
+                ollama_tools.append(ollama_tool)
             
             if self.verbose_mode:
-                print(f"✅ Доступно {len(tools_for_llm)} MCP инструментов:")
-                for tool in tools_for_llm:
-                    print(f"   • {tool['name']}: {tool['description']}")
+                print(f"✅ Преобразовано {len(ollama_tools)} MCP инструментов в формат Ollama:")
+                for tool in ollama_tools:
+                    print(f"   • {tool['function']['name']}: {tool['function']['description']}")
                 print()
             
-            # Формируем системный промпт с описанием доступных инструментов
-            system_prompt = self.build_system_prompt_with_tools(tools_for_llm)
+            # Подготавливаем сообщения для Ollama
+            messages = [
+                {
+                    "role": "system", 
+                    "content": self.build_system_prompt()
+                }
+            ]
             
-            # Формируем контекст разговора
-            conversation_context = self.build_conversation_context()
-            
-            # Полный промпт для модели
-            full_prompt = f"{system_prompt}\n\n{conversation_context}\n\nПользователь: {question}\n\nПомощник:"
+            # Добавляем историю разговора (последние 6 сообщений)
+            if self.conversation_history:
+                messages.extend(self.conversation_history[-6:])
             
             if self.verbose_mode:
-                print("🤖 Отправляю запрос в Ollama с доступными инструментами...")
+                print("🤖 Отправляю запрос в Ollama с tool calling...")
             
             # Отправляем запрос в Ollama
-            response = self.ollama.query_ollama(full_prompt)
+            response = self.ollama.chat_with_tools(messages, ollama_tools)
             
-            # Анализируем ответ модели на предмет вызова инструментов
-            final_response = await self.process_llm_response(response)
+            if "error" in response:
+                print(f"❌ Ошибка Ollama: {response['error']}")
+                return
+            
+            # Обрабатываем ответ
+            assistant_message = response["message"]
             
             if self.verbose_mode:
-                print("=" * 60)
+                print("📤 Получен ответ от Ollama")
                 
-            # Выводим финальный ответ
-            print(f"🤖 Помощник: {final_response}")
-            print()
-            
-            # Добавляем ответ в историю
-            self.conversation_history.append({
-                "role": "assistant", 
-                "content": final_response
-            })
-            
+            # Проверяем наличие tool calls
+            if assistant_message.get("tool_calls"):
+                await self.handle_tool_calls(assistant_message, messages, ollama_tools)
+            else:
+                # Просто выводим ответ модели
+                final_response = assistant_message.get("content", "")
+                
+                if self.verbose_mode:
+                    print("ℹ️ Модель не вызвала инструменты")
+                    print("=" * 60)
+                    
+                print(f"🤖 Помощник: {final_response}")
+                print()
+                
+                # Добавляем ответ в историю
+                self.conversation_history.append({
+                    "role": "assistant", 
+                    "content": final_response
+                })
+                
         except Exception as e:
             print(f"❌ Ошибка обработки вопроса: {e}")
             print()
-    
-    def build_conversation_context(self) -> str:
-        """Строим контекст разговора"""
-        if not self.conversation_history:
-            return ""
-        
-        # Берем последние 6 сообщений для контекста
-        recent_history = self.conversation_history[-6:]
-        context_lines = []
-        
-        for msg in recent_history:
-            role = "Пользователь" if msg['role'] == 'user' else "Помощник"
-            context_lines.append(f"{role}: {msg['content']}")
-        
-        return "\nПРЕДЫДУЩИЙ КОНТЕКСТ:\n" + "\n".join(context_lines)
 
-    def build_system_prompt_with_tools(self, tools_for_llm: List[Dict[str, Any]]) -> str:
-        """Строим системный промпт с описанием доступных инструментов"""
-        system_prompt = """Ты полезный корпоративный помощник. У тебя есть доступ к следующим инструментам:
-
-"""
-        for tool in tools_for_llm:
-            system_prompt += f"- {tool['name']}: {tool['description']}\n"
-        
-        system_prompt += """
-ВАЖНО: Если для ответа на вопрос нужны данные из инструментов, используй следующий формат:
-[TOOL_CALL:имя_инструмента:параметры]
-
-Примеры:
-- [TOOL_CALL:get_available_slots:{}]
-- [TOOL_CALL:schedule_meeting:{"date":"2024-01-19","time":"14:00","title":"Встреча"}]
-- [TOOL_CALL:search_regulations:{"query":"отпуск"}]
-
-После вызова инструмента я предоставлю тебе результат, и ты сможешь дать полный ответ.
-Отвечай на русском языке, кратко и по делу."""
-        return system_prompt
-
-    async def process_llm_response(self, response: str) -> str:
-        """Обрабатываем ответ модели и вызываем необходимые инструменты"""
-        import re
-        
-        # Ищем вызовы инструментов в формате [TOOL_CALL:name:params]
-        tool_pattern = r'\[TOOL_CALL:([^:]+):([^\]]+)\]'
-        tool_calls = re.findall(tool_pattern, response)
-        
-        if not tool_calls:
-            # Нет вызовов инструментов - возвращаем ответ как есть
-            return response
+    async def handle_tool_calls(self, assistant_message: Dict, messages: List[Dict], ollama_tools: List[Dict]):
+        """Обработка вызовов инструментов"""
+        tool_calls = assistant_message["tool_calls"]
         
         if self.verbose_mode:
-            print(f"🔧 Модель запросила {len(tool_calls)} инструментов:")
+            print(f"🔧 Модель вызвала {len(tool_calls)} инструментов:")
+            for i, tool_call in enumerate(tool_calls, 1):
+                func = tool_call["function"]
+                print(f"   {i}. {func['name']} с аргументами: {func['arguments']}")
+            print()
         
-        # Обрабатываем каждый вызов инструмента
-        final_response = response
-        for tool_name, params_str in tool_calls:
+        # Добавляем сообщение ассистента с tool calls в историю
+        messages.append({
+            "role": "assistant",
+            "content": assistant_message.get("content", ""),
+            "tool_calls": tool_calls
+        })
+        
+        # Выполняем каждый tool call
+        for tool_call in tool_calls:
+            function = tool_call["function"]
+            tool_name = function["name"]
+            tool_args = function["arguments"]
+            
             try:
                 if self.verbose_mode:
-                    print(f"   📞 Вызываю {tool_name} с параметрами: {params_str}")
-                
-                # Парсим параметры (могут быть JSON или пустые)
-                try:
-                    params = json.loads(params_str) if params_str.strip() != '{}' else {}
-                except json.JSONDecodeError:
-                    params = {}
+                    print(f"   📞 Выполняю {tool_name}...")
                 
                 # Вызываем MCP инструмент
-                result = await self.mcp_client.call_tool(tool_name, params)
+                result = await self.mcp_client.call_tool(tool_name, tool_args)
                 tool_result = result["content"][0]["text"]
                 
                 if self.verbose_mode:
-                    print(f"   ✅ Результат {tool_name}: {tool_result[:100]}...")
+                    print(f"   ✅ Результат: {tool_result[:100]}...")
                 
-                # Заменяем вызов инструмента на результат
-                tool_call_pattern = f"\\[TOOL_CALL:{tool_name}:{re.escape(params_str)}\\]"
-                final_response = re.sub(tool_call_pattern, tool_result, final_response)
+                # Добавляем результат tool call
+                messages.append({
+                    "role": "tool",
+                    "content": tool_result
+                })
                 
             except Exception as e:
-                error_msg = f"Ошибка вызова {tool_name}: {e}"
+                error_msg = f"Ошибка выполнения {tool_name}: {e}"
                 if self.verbose_mode:
                     print(f"   ❌ {error_msg}")
-                final_response = re.sub(f"\\[TOOL_CALL:{tool_name}:{re.escape(params_str)}\\]", 
-                                      error_msg, final_response)
+                
+                messages.append({
+                    "role": "tool", 
+                    "content": error_msg
+                })
         
-        return final_response
+        # Отправляем второй запрос с результатами tool calls
+        if self.verbose_mode:
+            print("\n🔄 Отправляю результаты инструментов обратно в модель...")
+        
+        final_response = self.ollama.chat_with_tools(messages, ollama_tools)
+        
+        if "error" in final_response:
+            print(f"❌ Ошибка финального запроса: {final_response['error']}")
+            return
+            
+        final_content = final_response["message"].get("content", "")
+        
+        if self.verbose_mode:
+            print("=" * 60)
+            
+        print(f"🤖 Помощник: {final_content}")
+        print()
+        
+        # Добавляем финальный ответ в историю
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": final_content
+        })
+
+    def build_system_prompt(self) -> str:
+        """Строим системный промпт"""
+        return """Ты полезный корпоративный помощник. 
+
+У тебя есть доступ к корпоративным инструментам для:
+- Просмотра доступных временных слотов
+- Планирования встреч
+- Поиска по корпоративным регламентам  
+- Получения планов развития сотрудников
+
+ВАЖНО: 
+- Используй доступные инструменты когда они нужны для ответа
+- Внимательно читай результаты выполнения инструментов
+- Если инструмент возвращает ошибку (success: false), честно сообщи об этом
+- При неудачном бронировании предложи доступные альтернативы
+- Отвечай на русском языке, кратко и по делу"""
 
 
 def setup_signal_handler():
