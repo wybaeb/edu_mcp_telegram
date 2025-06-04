@@ -16,7 +16,7 @@ from test_client import MCPTestClient
 class OllamaIntegration:
     """Интеграция с локальным Ollama для tool calling"""
     
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "mistral:latest"):
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama3.2:3b-instruct-q5_K_M"):
         self.base_url = base_url
         self.model = model
     
@@ -78,7 +78,7 @@ class InteractiveMCPChat:
         # Проверка Ollama
         if not self.ollama.check_ollama_availability():
             print("❌ Ollama недоступен! Запустите: ollama serve")
-            print("И убедитесь что модель mistral:latest загружена: ollama pull mistral:latest")
+            print("И убедитесь что модель llama3.2:3b-instruct-q5_K_M загружена: ollama pull llama3.2:3b-instruct-q5_K_M")
             return
         
         print("✅ Ollama подключен!")
@@ -440,20 +440,21 @@ class InteractiveMCPChat:
 
     def build_system_prompt(self) -> str:
         """Строим системный промпт"""
-        return """Ты полезный корпоративный помощник. 
+        return """You are a helpful corporate assistant. You have access to several tools that help you answer user questions.
 
-У тебя есть доступ к корпоративным инструментам для:
-- Просмотра доступных временных слотов
-- Планирования встреч
-- Поиска по корпоративным регламентам  
-- Получения планов развития сотрудников
+AVAILABLE TOOLS: When you need data to answer a question, you MUST use the available tools. Never provide made-up information.
 
-ВАЖНО: 
-- Используй доступные инструменты когда они нужны для ответа
-- Внимательно читай результаты выполнения инструментов
-- Если инструмент возвращает ошибку (success: false), честно сообщи об этом
-- При неудачном бронировании предложи доступные альтернативы
-- Отвечай на русском языке, кратко и по делу"""
+IMPORTANT: Always use the tools when they can provide the information needed to answer the user's question. Don't just describe the tools - actually use them.
+
+Rules:
+- If the user asks about time slots or schedule → use get_available_slots
+- If the user wants to schedule a meeting → use schedule_meeting
+- If the user asks about regulations or policies → use search_regulations  
+- If the user asks about development plans → use get_development_plan
+
+Always respond in Russian after using the tools.
+
+Example: If user asks "Покажи доступные слоты", you should call get_available_slots tool, then provide the results in Russian."""
 
 
 def setup_signal_handler():
