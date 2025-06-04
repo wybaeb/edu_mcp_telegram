@@ -22,6 +22,7 @@ class InteractiveMCPChat:
         self.conversation_history = []
         self.available_tools = []
         self.running = True
+        self.verbose_mode = True  # По умолчанию показываем процесс работы
         
     async def start(self):
         """Запуск интерактивного чата"""
@@ -68,8 +69,11 @@ class InteractiveMCPChat:
         print("  /search <запрос> - поиск по регламентам")
         print("  /history - показать историю разговора")
         print("  /clear - очистить историю")
+        print("  /debug - переключить режим отладки (показ MCP инструментов)")
         print("  /exit или /quit - выход")
         print()
+        debug_status = "ВКЛЮЧЕН" if self.verbose_mode else "ВЫКЛЮЧЕН"
+        print(f"🔍 Режим отладки: {debug_status}")
         print("💬 Или просто задайте любой вопрос - я отвечу используя доступные данные!")
         print("=" * 60)
         print()
@@ -208,6 +212,16 @@ class InteractiveMCPChat:
             print("🧹 История очищена")
             print()
             
+        elif cmd == 'debug':
+            self.verbose_mode = not self.verbose_mode
+            status = "ВКЛЮЧЕН" if self.verbose_mode else "ВЫКЛЮЧЕН"
+            print(f"🔍 Режим отладки: {status}")
+            if self.verbose_mode:
+                print("   Теперь вы будете видеть какие MCP инструменты использует AI")
+            else:
+                print("   Отладочная информация скрыта")
+            print()
+            
         else:
             print(f"❌ Неизвестная команда: {cmd}")
             print("💡 Введите /help для справки")
@@ -215,7 +229,11 @@ class InteractiveMCPChat:
     
     async def handle_question(self, question: str):
         """Обработка обычного вопроса через LLM с контекстом MCP"""
-        print("🤔 Обрабатываю ваш вопрос...")
+        if self.verbose_mode:
+            print("🔍 === АНАЛИЗ ВОПРОСА ===")
+            print(f"📝 Вопрос: {question}")
+        else:
+            print("🤔 Обрабатываю ваш вопрос...")
         
         # Добавляем вопрос в историю
         self.conversation_history.append({
@@ -224,96 +242,61 @@ class InteractiveMCPChat:
         })
         
         try:
-            # Определяем нужные ли нам данные из MCP
-            context_data = await self.gather_context_for_question(question)
+            # Получаем список доступных MCP инструментов
+            if self.verbose_mode:
+                print("🔧 Получаю список доступных MCP инструментов...")
             
-            # Формируем контекст для LLM
-            system_context = self.build_system_context(context_data)
+            available_tools = await self.mcp_client.list_tools()
             
-            # Формируем полный промпт
+            # Преобразуем MCP инструменты в формат для Ollama
+            tools_for_llm = []
+            for tool in available_tools:
+                tools_for_llm.append({
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["inputSchema"]
+                })
+            
+            if self.verbose_mode:
+                print(f"✅ Доступно {len(tools_for_llm)} MCP инструментов:")
+                for tool in tools_for_llm:
+                    print(f"   • {tool['name']}: {tool['description']}")
+                print()
+            
+            # Формируем системный промпт с описанием доступных инструментов
+            system_prompt = self.build_system_prompt_with_tools(tools_for_llm)
+            
+            # Формируем контекст разговора
             conversation_context = self.build_conversation_context()
-            full_prompt = f"{system_context}\n\n{conversation_context}\n\nПользователь: {question}\n\nПомощник:"
             
-            # Отправляем в Ollama
+            # Полный промпт для модели
+            full_prompt = f"{system_prompt}\n\n{conversation_context}\n\nПользователь: {question}\n\nПомощник:"
+            
+            if self.verbose_mode:
+                print("🤖 Отправляю запрос в Ollama с доступными инструментами...")
+            
+            # Отправляем запрос в Ollama
             response = self.ollama.query_ollama(full_prompt)
             
-            # Выводим ответ
-            print(f"🤖 Помощник: {response}")
+            # Анализируем ответ модели на предмет вызова инструментов
+            final_response = await self.process_llm_response(response)
+            
+            if self.verbose_mode:
+                print("=" * 60)
+                
+            # Выводим финальный ответ
+            print(f"🤖 Помощник: {final_response}")
             print()
             
             # Добавляем ответ в историю
             self.conversation_history.append({
                 "role": "assistant", 
-                "content": response
+                "content": final_response
             })
             
         except Exception as e:
             print(f"❌ Ошибка обработки вопроса: {e}")
             print()
-    
-    async def gather_context_for_question(self, question: str) -> Dict[str, Any]:
-        """Собираем контекстную информацию из MCP для вопроса"""
-        context = {}
-        question_lower = question.lower()
-        
-        try:
-            # Если вопрос про время, слоты, встречи
-            if any(word in question_lower for word in ['время', 'слот', 'встреча', 'календарь', 'свободн']):
-                result = await self.mcp_client.call_tool("get_available_slots")
-                context['calendar'] = json.loads(result["content"][0]["text"])
-            
-            # Если вопрос про развитие, карьеру, навыки
-            if any(word in question_lower for word in ['развитие', 'карьер', 'навык', 'план', 'обучен']):
-                result = await self.mcp_client.call_tool("get_development_plan")
-                context['development'] = json.loads(result["content"][0]["text"])
-            
-            # Если вопрос про правила, регламенты, политики
-            if any(word in question_lower for word in ['правил', 'регламент', 'политик', 'отпуск', 'больничн', 'дресс']):
-                # Пытаемся найти релевантные регламенты
-                for keyword in ['отпуск', 'больничный', 'дресс-код', 'удаленная работа', 'обучение']:
-                    if keyword in question_lower:
-                        result = await self.mcp_client.call_tool("search_regulations", {"query": keyword})
-                        regulations_data = json.loads(result["content"][0]["text"])
-                        if regulations_data.get('results'):
-                            context['regulations'] = regulations_data
-                            break
-        
-        except Exception as e:
-            print(f"⚠️  Ошибка сбора контекста: {e}")
-        
-        return context
-    
-    def build_system_context(self, context_data: Dict[str, Any]) -> str:
-        """Строим системный контекст для LLM"""
-        context_parts = [
-            "Ты полезный корпоративный помощник. У тебя есть доступ к следующим данным компании:"
-        ]
-        
-        if 'calendar' in context_data:
-            calendar_info = "КАЛЕНДАРЬ:\n"
-            for slot in context_data['calendar'].get('available_slots', []):
-                calendar_info += f"- {slot['date']}: {', '.join(slot['available_times'])}\n"
-            context_parts.append(calendar_info)
-        
-        if 'development' in context_data:
-            dev_info = f"ПЛАН РАЗВИТИЯ:\n"
-            dev_data = context_data['development']
-            dev_info += f"- Текущий уровень: {dev_data['current_level']}\n"
-            dev_info += f"- Целевой уровень: {dev_data['target_level']}\n"
-            dev_info += "- Навыки для развития:\n"
-            for skill in dev_data['skills_to_develop']:
-                dev_info += f"  • {skill['skill']} ({skill['current_level']} → {skill['target_level']}, дедлайн: {skill['deadline']})\n"
-            context_parts.append(dev_info)
-        
-        if 'regulations' in context_data:
-            reg_info = "КОРПОРАТИВНЫЕ РЕГЛАМЕНТЫ:\n"
-            for result in context_data['regulations'].get('results', []):
-                reg_info += f"- {result['question']}\n  {result['answer']}\n\n"
-            context_parts.append(reg_info)
-        
-        context_parts.append("Отвечай на русском языке, кратко и по делу. Используй предоставленную информацию.")
-        
-        return "\n\n".join(context_parts)
     
     def build_conversation_context(self) -> str:
         """Строим контекст разговора"""
@@ -329,6 +312,75 @@ class InteractiveMCPChat:
             context_lines.append(f"{role}: {msg['content']}")
         
         return "\nПРЕДЫДУЩИЙ КОНТЕКСТ:\n" + "\n".join(context_lines)
+
+    def build_system_prompt_with_tools(self, tools_for_llm: List[Dict[str, Any]]) -> str:
+        """Строим системный промпт с описанием доступных инструментов"""
+        system_prompt = """Ты полезный корпоративный помощник. У тебя есть доступ к следующим инструментам:
+
+"""
+        for tool in tools_for_llm:
+            system_prompt += f"- {tool['name']}: {tool['description']}\n"
+        
+        system_prompt += """
+ВАЖНО: Если для ответа на вопрос нужны данные из инструментов, используй следующий формат:
+[TOOL_CALL:имя_инструмента:параметры]
+
+Примеры:
+- [TOOL_CALL:get_available_slots:{}]
+- [TOOL_CALL:schedule_meeting:{"date":"2024-01-19","time":"14:00","title":"Встреча"}]
+- [TOOL_CALL:search_regulations:{"query":"отпуск"}]
+
+После вызова инструмента я предоставлю тебе результат, и ты сможешь дать полный ответ.
+Отвечай на русском языке, кратко и по делу."""
+        return system_prompt
+
+    async def process_llm_response(self, response: str) -> str:
+        """Обрабатываем ответ модели и вызываем необходимые инструменты"""
+        import re
+        
+        # Ищем вызовы инструментов в формате [TOOL_CALL:name:params]
+        tool_pattern = r'\[TOOL_CALL:([^:]+):([^\]]+)\]'
+        tool_calls = re.findall(tool_pattern, response)
+        
+        if not tool_calls:
+            # Нет вызовов инструментов - возвращаем ответ как есть
+            return response
+        
+        if self.verbose_mode:
+            print(f"🔧 Модель запросила {len(tool_calls)} инструментов:")
+        
+        # Обрабатываем каждый вызов инструмента
+        final_response = response
+        for tool_name, params_str in tool_calls:
+            try:
+                if self.verbose_mode:
+                    print(f"   📞 Вызываю {tool_name} с параметрами: {params_str}")
+                
+                # Парсим параметры (могут быть JSON или пустые)
+                try:
+                    params = json.loads(params_str) if params_str.strip() != '{}' else {}
+                except json.JSONDecodeError:
+                    params = {}
+                
+                # Вызываем MCP инструмент
+                result = await self.mcp_client.call_tool(tool_name, params)
+                tool_result = result["content"][0]["text"]
+                
+                if self.verbose_mode:
+                    print(f"   ✅ Результат {tool_name}: {tool_result[:100]}...")
+                
+                # Заменяем вызов инструмента на результат
+                tool_call_pattern = f"\\[TOOL_CALL:{tool_name}:{re.escape(params_str)}\\]"
+                final_response = re.sub(tool_call_pattern, tool_result, final_response)
+                
+            except Exception as e:
+                error_msg = f"Ошибка вызова {tool_name}: {e}"
+                if self.verbose_mode:
+                    print(f"   ❌ {error_msg}")
+                final_response = re.sub(f"\\[TOOL_CALL:{tool_name}:{re.escape(params_str)}\\]", 
+                                      error_msg, final_response)
+        
+        return final_response
 
 
 def setup_signal_handler():
