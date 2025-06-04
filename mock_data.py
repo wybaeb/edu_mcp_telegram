@@ -154,18 +154,75 @@ def get_development_plan() -> Dict[str, Any]:
     """Возвращает индивидуальный план развития"""
     return DEVELOPMENT_PLAN
 
+def normalize_text(text: str) -> str:
+    """Нормализация текста для поиска"""
+    text = text.lower()
+    # Убираем дефисы и подчеркивания
+    text = text.replace("-", " ").replace("_", " ")
+    # Убираем лишние пробелы
+    text = " ".join(text.split())
+    return text
+
+def get_search_keywords(query: str) -> List[str]:
+    """Расширяет поисковый запрос синонимами"""
+    normalized_query = normalize_text(query)
+    
+    # Словарь синонимов для лучшего поиска
+    synonyms = {
+        "дресс код": ["дресс-код", "dress code", "одежда", "внешний вид", "стиль одежды", "дресскод"],
+        "дресскод": ["дресс-код", "dress code", "одежда", "внешний вид", "стиль одежды"],
+        "одежда": ["дресс-код", "dress code", "внешний вид", "стиль"],
+        "отпуск": ["vacation", "каникулы", "отгулы"],
+        "удаленка": ["remote", "удаленная работа", "дистанционная работа", "дом"],
+        "больничный": ["sick leave", "болезнь", "лечение"],
+        "рабочее время": ["working hours", "график работы", "часы работы"],
+        "обучение": ["learning", "курсы", "развитие", "образование"],
+        "оборудование": ["equipment", "техника", "ноутбук", "компьютер"]
+    }
+    
+    keywords = [normalized_query]
+    
+    # Добавляем синонимы
+    for key, values in synonyms.items():
+        if key in normalized_query or normalized_query in key:
+            keywords.extend(values)
+            break
+    
+    # Добавляем отдельные слова из запроса
+    words = normalized_query.split()
+    if len(words) > 1:
+        keywords.extend(words)
+    
+    return keywords
+
 def search_corporate_regulations(query: str) -> List[Dict[str, str]]:
-    """Поиск по корпоративным регламентам"""
-    query_lower = query.lower()
+    """Улучшенный поиск по корпоративным регламентам"""
+    if not query.strip():
+        return []
+    
+    keywords = get_search_keywords(query)
     results = []
+    found_topics = set()  # Чтобы избежать дубликатов
     
     for key, regulation in CORPORATE_REGULATIONS.items():
-        if (query_lower in regulation["question"].lower() or 
-            query_lower in regulation["answer"].lower()):
+        question_normalized = normalize_text(regulation["question"])
+        answer_normalized = normalize_text(regulation["answer"])
+        
+        # Проверяем совпадение с любым из ключевых слов
+        match_found = False
+        for keyword in keywords:
+            if (keyword in question_normalized or 
+                keyword in answer_normalized or
+                keyword in key.replace("_", " ")):  # Проверяем и ключ топика
+                match_found = True
+                break
+        
+        if match_found and key not in found_topics:
             results.append({
                 "topic": key,
                 "question": regulation["question"],
                 "answer": regulation["answer"]
             })
+            found_topics.add(key)
     
     return results 
