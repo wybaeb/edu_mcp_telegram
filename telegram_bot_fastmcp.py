@@ -142,26 +142,40 @@ class MCPTelegramBot:
     
     def build_system_prompt(self) -> str:
         """Строим системный промпт для AI"""
-        return """You are a helpful corporate assistant with access to several MCP tools. You understand both Russian and English and always respond in Russian.
+        return """You are a helpful corporate assistant with access to MCP tools. You understand both Russian and English and always respond in Russian.
 
-AVAILABLE TOOLS: When you need data to answer a question, you MUST use the available tools. Never provide made-up information.
+CRITICAL: You MUST use the available tools to get real data. NEVER provide made-up information about company policies, schedules, or regulations.
 
-IMPORTANT: Always use the tools when they can provide the information needed to answer the user's question. Don't just describe the tools - actually use them.
+TOOL USAGE RULES:
+- For ANY question about time slots, meetings, calendar, расписание, слоты → ALWAYS use get_available_slots first
+- For scheduling meetings, планирование встреч → use schedule_meeting with required parameters
+- For questions about company policies, regulations, rules, отпуск, больничный, дресс-код, регламенты → ALWAYS use search_regulations
+- For career development, план развития, навыки → use get_development_plan
+- For listing available tools → use list_tools
 
-Rules:
-- If the user asks about time slots, schedule, or встречи → use get_available_slots
-- If the user wants to schedule a meeting → use schedule_meeting
-- If the user asks about regulations, policies, or регламенты → use search_regulations  
-- If the user asks about development plans or план развития → use get_development_plan
-- If the user asks about available tools → use list_tools
+TOOL PARAMETERS:
+- schedule_meeting: {"date": "YYYY-MM-DD", "time": "HH:MM", "title": "Meeting name", "duration": 60}
+  ⚠️ duration MUST be integer (number), title MUST not be empty
+- search_regulations: {"query": "search term"}
+  ⚠️ query MUST not be empty, use specific keywords like "отпуск", "дресс-код", etc.
 
-Always respond in Russian after using the tools. Format your response clearly with emojis, but avoid complex Markdown formatting that might break. Use simple formatting only.
+EXAMPLES WITH CORRECT PARAMETERS:
+✅ For "Запланируй встречу на завтра в 10:00":
+   schedule_meeting({"date": "2024-01-16", "time": "10:00", "title": "Планируемая встреча", "duration": 60})
 
-Examples:
-- "Покажи доступные слоты" → call get_available_slots tool
-- "Запланируй встречу на завтра" → call schedule_meeting tool
-- "Что говорится об отпусках?" → call search_regulations with query "отпуск"
-- "Мой план развития" → call get_development_plan tool"""
+✅ For "Что говорит регламент об отпусках?":
+   search_regulations({"query": "отпуск"})
+
+✅ For "Дресс-код компании":
+   search_regulations({"query": "дресс-код"})
+
+RESPONSE FORMAT:
+- Always use tools when the question relates to company data
+- Respond in Russian with clear formatting  
+- Use emojis but avoid complex Markdown that might break
+- Be helpful and comprehensive based on the tool results
+
+If you can't answer without tools and no relevant tool exists, say so clearly."""
     
     def safe_json_parse(self, text):
         """Safely parse JSON string"""
@@ -576,20 +590,23 @@ Examples:
         
         # Проверяем наличие tool calls
         if assistant_message.get("tool_calls"):
-            return await self.handle_ai_tool_calls(assistant_message, messages, ollama_tools, debug_mode)
+            return await self.handle_ai_tool_calls(assistant_message, messages, ollama_tools, debug_mode, user_id)
         else:
             final_response = assistant_message.get("content", "")
             if debug_mode:
                 logger.info("ℹ️ AI не вызвал инструменты")
+                final_response = f"🔍 **DEBUG:** AI не вызвал инструменты, генерирует ответ самостоятельно\n\n{final_response}"
             return final_response if final_response else "🤔 Не смог обработать ваш запрос"
     
-    async def handle_ai_tool_calls(self, assistant_message: Dict, messages: List[Dict], ollama_tools: List[Dict], debug_mode: bool) -> str:
+    async def handle_ai_tool_calls(self, assistant_message: Dict, messages: List[Dict], ollama_tools: List[Dict], debug_mode: bool, user_id: int) -> str:
         """Обработка вызовов инструментов AI"""
         tool_calls = assistant_message["tool_calls"]
+        debug_info = []
         
         if debug_mode:
             tools_list = [tool_call["function"]["name"] for tool_call in tool_calls]
             logger.info(f"🔧 AI вызвал {len(tool_calls)} инструментов: {', '.join(tools_list)}")
+            debug_info.append(f"🔧 **DEBUG:** AI вызвал {len(tool_calls)} инструментов: {', '.join(tools_list)}")
         
         # Добавляем сообщение ассистента с tool calls
         messages.append({
@@ -607,11 +624,28 @@ Examples:
             try:
                 if debug_mode:
                     logger.info(f"📞 Выполняю {tool_name} с аргументами: {tool_args}")
+                    debug_info.append(f"📞 **Выполняю:** {tool_name} с аргументами: `{tool_args}`")
+                
+                # Исправляем аргументы для schedule_meeting
+                if tool_name == "schedule_meeting" and isinstance(tool_args, dict):
+                    # Убеждаемся что duration это int
+                    if "duration" in tool_args:
+                        try:
+                            tool_args["duration"] = int(tool_args["duration"]) if tool_args["duration"] else 60
+                        except (ValueError, TypeError):
+                            tool_args["duration"] = 60
+                    else:
+                        tool_args["duration"] = 60
+                    
+                    # Убеждаемся что title не пустой
+                    if not tool_args.get("title"):
+                        tool_args["title"] = "Запланированная встреча"
                 
                 result = await self.call_mcp_tool(tool_name, tool_args)
                 
                 if debug_mode:
-                    logger.info(f"✅ Результат {tool_name}: {result[:100]}...")
+                    logger.info(f"✅ Результат {tool_name}: {result[:200]}...")
+                    debug_info.append(f"✅ **Результат {tool_name}:** ```{result[:300]}...```")
                 
                 messages.append({
                     "role": "tool",
@@ -619,9 +653,13 @@ Examples:
                 })
                 
             except Exception as e:
-                error_msg = f"Ошибка выполнения {tool_name}: {e}"
+                error_msg = f"Ошибка выполнения {tool_name}: {str(e)}"
+                full_error = str(e)
+                
                 if debug_mode:
                     logger.error(f"❌ {error_msg}")
+                    logger.error(f"Полная ошибка: {full_error}")
+                    debug_info.append(f"❌ **ПОЛНАЯ ОШИБКА {tool_name}:**\n```\n{full_error}\n```")
                 
                 messages.append({
                     "role": "tool", 
@@ -631,13 +669,21 @@ Examples:
         # Отправляем второй запрос с результатами tool calls
         if debug_mode:
             logger.info("🔄 Отправляю результаты инструментов обратно в AI...")
+            debug_info.append("🔄 **Формирую финальный ответ на основе результатов инструментов...**")
         
         final_response = self.ollama.chat_with_tools(messages, ollama_tools)
         
         if "error" in final_response:
             return f"❌ Ошибка финального запроса: {final_response['error']}"
-            
-        return final_response["message"].get("content", "🤔 Не смог сформулировать ответ")
+        
+        ai_response = final_response["message"].get("content", "🤔 Не смог сформулировать ответ")
+        
+        # В debug режиме добавляем debug информацию к ответу
+        if debug_mode and debug_info:
+            debug_section = "\n\n".join(debug_info)
+            return f"{debug_section}\n\n---\n\n{ai_response}"
+        
+        return ai_response
 
     # Updated text handler - now primary interface
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
