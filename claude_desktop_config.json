@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "educational-mcp-server": {
+      "command": "python3",
+      "args": ["mcp_server.py"],
+      "cwd": "/home/complex/panteo/dev/edu_mcp_telegram",
+      "env": {
+        "PYTHONPATH": "/home/complex/panteo/dev/edu_mcp_telegram/venv/lib/python3.8/site-packages"
+      }
+    }
+  }
+} 
